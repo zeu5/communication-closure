@@ -1,6 +1,5 @@
 /-!
-An ordinary Lean model of the Raft TLA+ spec in
-`CommunicationClosure/Protocols/Raft.tla`.
+An ordinary Lean model of the Raft TLA+ spec in https://github.com/dranov/raft-tla/blob/master/tlc_membership/raft.tla.
 
 The TLA+ file models Raft, an unreliable network, crashes, and dynamic
 membership.  This file keeps the same shape as a vanilla Lean transition
