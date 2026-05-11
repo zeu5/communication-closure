@@ -3,3 +3,4 @@
 import CommunicationClosure.Protocols.Paxos
 import CommunicationClosure.Protocols.Raft
 import CommunicationClosure.Proofs.Paxos
+import CommunicationClosure.Proofs.Raft
