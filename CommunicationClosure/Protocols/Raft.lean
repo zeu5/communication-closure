@@ -23,8 +23,9 @@ inductive Role where
   | leader
   deriving DecidableEq, Repr
 
-/-- Log-entry tags from the TLA constants `ValueEntry` and `ConfigEntry`. -/
+/-- Log-entry tags, including the no-op entry leaders append when elected. -/
 inductive EntryKind where
+  | noop
   | value
   | config
   deriving DecidableEq, Repr
@@ -60,6 +61,7 @@ end Params
 
 /-- Values stored in log entries. -/
 inductive EntryValue (p : Params) where
+  | noop
   | client (v : p.Value)
   | config (c : p.Config)
 
@@ -260,10 +262,13 @@ def timeout [DecidableEq p.Server] (i : p.Server) (s s' : State p) : Prop :=
 def becomeLeader [DecidableEq p.Server] (i : p.Server) (s s' : State p) : Prop :=
   s.role i = Role.candidate ∧
   p.Quorum (getConfig s i) (s.votesGranted i) ∧
+  let entry : Entry p := { term := s.currentTerm i, kind := EntryKind.noop, value := EntryValue.noop }
+  let newLog := s.log i ++ [entry]
   s' =
     { s with
       role := update s.role i Role.leader
-      nextIndex := update s.nextIndex i (fun _ => (s.log i).length + 1)
+      log := update s.log i newLog
+      nextIndex := update s.nextIndex i (fun _ => newLog.length + 1)
       matchIndex := update s.matchIndex i (fun _ => 0) }
 
 def clientRequest [DecidableEq p.Server]
