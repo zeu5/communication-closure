@@ -2,5 +2,7 @@
 -- Import modules here that should be built as part of the library.
 import CommunicationClosure.Protocols.Paxos
 import CommunicationClosure.Protocols.Raft
+import CommunicationClosure.Protocols.RaftWithHistory
 import CommunicationClosure.Proofs.Paxos
 import CommunicationClosure.Proofs.Raft
+import CommunicationClosure.Proofs.RaftWithHistory

@@ -1,6 +1,6 @@
 name = "communication-closure"
 version = "0.1.0"
-defaultTargets = ["communication-closure"]
+defaultTargets = ["CommunicationClosure"]
 
 [[lean_lib]]
 name = "CommunicationClosure"
