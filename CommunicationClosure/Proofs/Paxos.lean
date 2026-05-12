@@ -3,18 +3,26 @@ import CommunicationClosure.Protocols.Paxos
 /-!
 Communication-closure facts for the ordinary Lean Paxos model.
 
-The protocol model does not expose a separate `currentRound` variable.  Instead,
-`left_rnd n r` is the local-time guard: once a node joins a later round, all
-lower rounds are marked as left, and future node actions at those rounds are
-disabled.  The lemmas below encode the three communication-closure principles in
-that vocabulary:
+The paper linked from the repository README uses "communication-closed" for a
+round discipline: messages sent for a round are received only in that round, and
+no cross-round messages remain in the medium at round boundaries.
+
+This Paxos model does not carry an explicit network.  Its mutable relations are
+the persistent record of Paxos messages that have been sent and can be read by
+later actions.  The definitions below therefore make the network view explicit
+as a proof layer:
 
 * each step preserves previously-left rounds;
-* each step has a single primary communication round;
-* all newly-created message/state facts are tagged with that round, while new
-  `left_rnd` facts are only for rounds below it; and
-* actions that consume round-tagged facts consume them at the same round as the
-  action's local guard.
+* each step has a single communication round;
+* all newly-sent Paxos messages are tagged with that round;
+* all messages received by the action are tagged with that same round and are
+  already present in the pre-state; and
+* the abstract medium is empty before and after the atomic communication-closed
+  step.
+
+`left_rnd` is local-time state rather than a network message: joining round `r`
+newly marks only rounds below `r` as left, disabling future local actions at
+those lower rounds.
 -/
 
 namespace CommunicationClosure.Proofs.Paxos
@@ -26,6 +34,93 @@ variable {p : Params}
 /-- A node never re-enters a round it has already left. -/
 def LocalTimeMonotoneStep (s s' : State p) : Prop :=
   ∀ n r, s.left_rnd n r → s'.left_rnd n r
+
+/-- The Paxos facts that play the role of messages in the protocol model. -/
+inductive Message (p : Params) where
+  | one_a (r : p.Round)
+  | one_b_max_vote (n : p.Node) (r maxr : p.Round) (v : p.Value)
+  | one_b (n : p.Node) (r : p.Round)
+  | proposal (r : p.Round) (v : p.Value)
+  | vote (n : p.Node) (r : p.Round) (v : p.Value)
+  | decision (n : p.Node) (r : p.Round) (v : p.Value)
+
+namespace Message
+
+variable {p : Params}
+
+/-- The ballot/communication round attached to a Paxos message. -/
+def round : Message p → p.Round
+  | one_a r => r
+  | one_b_max_vote _ r _ _ => r
+  | one_b _ r => r
+  | proposal r _ => r
+  | vote _ r _ => r
+  | decision _ r _ => r
+
+/-- A message fact is present in a Paxos state. -/
+def Present (s : State p) : Message p → Prop
+  | one_a r => s.one_a r
+  | one_b_max_vote n r maxr v => s.one_b_max_vote n r maxr v
+  | one_b n r => s.one_b n r
+  | proposal r v => s.proposal r v
+  | vote n r v => s.vote n r v
+  | decision n r v => s.decision n r v
+
+end Message
+
+/-- A message is newly sent by a transition when it appears in the post-state. -/
+def SentByStep (s s' : State p) (msg : Message p) : Prop :=
+  Message.Present s' msg ∧ ¬ Message.Present s msg
+
+/-- The explicit medium used by the communication-closure proof layer. -/
+abbrev Medium (p : Params) := Message p → Prop
+
+/-- The medium has no in-flight messages. -/
+def MediumEmpty (m : Medium p) : Prop :=
+  ∀ msg, ¬ m msg
+
+/-- The boundary medium used by the ordinary Paxos model. -/
+def emptyMedium (p : Params) : Medium p :=
+  fun _ => False
+
+/-- A received message is one of the facts read by the action in round `r`. -/
+inductive ReceivedInRound (s s' : State p) (r : p.Round) : Message p → Prop where
+  | joinRound_one_a
+      {n : p.Node} {maxr : p.Round} {v : p.Value} :
+      Action.joinRound n r maxr v s s' →
+      ReceivedInRound s s' r (Message.one_a r)
+  | propose_one_b
+      {q : p.Quorum} {maxr : p.Round} {v : p.Value} {n : p.Node} :
+      Action.propose r q maxr v s s' →
+      p.member n q →
+      ReceivedInRound s s' r (Message.one_b n r)
+  | castVote_proposal
+      {n : p.Node} {v : p.Value} :
+      Action.castVote n r v s s' →
+      ReceivedInRound s s' r (Message.proposal r v)
+  | decide_vote
+      {n n' : p.Node} {v : p.Value} {q : p.Quorum} :
+      Action.decide n r v q s s' →
+      p.member n' q →
+      ReceivedInRound s s' r (Message.vote n' r v)
+
+/--
+The message-level form of communication closure for one Paxos action.
+
+The `preMedium` and `postMedium` fields are explicit so the statement matches
+the paper's "medium is empty at round boundaries" intuition.  The ordinary
+Paxos transition model has no network component, so the protocol theorem below
+instantiates both media with the empty predicate.
+-/
+def CommunicationClosedRound
+    (s s' : State p) (r : p.Round) (preMedium postMedium : Medium p) : Prop :=
+  p.NonNoneRound r ∧
+    MediumEmpty preMedium ∧
+    MediumEmpty postMedium ∧
+    LocalTimeMonotoneStep s s' ∧
+    (∀ msg, SentByStep s s' msg → Message.round msg = r) ∧
+    (∀ msg, ReceivedInRound s s' r msg → Message.round msg = r ∧ Message.Present s msg) ∧
+    (∀ n r', s'.left_rnd n r' → ¬ s.left_rnd n r' → p.Below r' r)
 
 /--
 All facts newly added by a step are attached to the step's communication round.
@@ -69,10 +164,66 @@ one primary round.
 -/
 def CommunicationClosedStep (s s' : State p) : Prop :=
   ∃ r : p.Round,
-    p.NonNoneRound r ∧
-      LocalTimeMonotoneStep s s' ∧
+    CommunicationClosedRound s s' r (emptyMedium p) (emptyMedium p) ∧
       PrimaryRoundChangesOnly s s' r ∧
       ActionReadsMatchingRound s s' r
+
+theorem primaryRound_sentByStep
+    {s s' : State p} {r : p.Round}
+    (h : PrimaryRoundChangesOnly s s' r) :
+    ∀ msg, SentByStep s s' msg → Message.round msg = r := by
+  rcases h with
+    ⟨hone_a, hone_b_max, hone_b, _hleft, hproposal, hvote, hdecision⟩
+  intro msg hsent
+  cases msg with
+  | one_a r' =>
+      exact hone_a r' hsent.1 hsent.2
+  | one_b_max_vote n r' maxr v =>
+      exact hone_b_max n r' maxr v hsent.1 hsent.2
+  | one_b n r' =>
+      exact hone_b n r' hsent.1 hsent.2
+  | proposal r' v =>
+      exact hproposal r' v hsent.1 hsent.2
+  | vote n r' v =>
+      exact hvote n r' v hsent.1 hsent.2
+  | decision n r' v =>
+      exact hdecision n r' v hsent.1 hsent.2
+
+theorem primaryRound_leftOnly
+    {s s' : State p} {r : p.Round}
+    (h : PrimaryRoundChangesOnly s s' r) :
+    ∀ n r', s'.left_rnd n r' → ¬ s.left_rnd n r' → p.Below r' r := by
+  exact h.2.2.2.1
+
+theorem receivedInRound_present
+    {s s' : State p} {r : p.Round} :
+    ∀ msg, ReceivedInRound s s' r msg →
+      Message.round msg = r ∧ Message.Present s msg := by
+  intro msg hrecv
+  cases hrecv with
+  | joinRound_one_a h =>
+      exact ⟨rfl, h.2.1⟩
+  | propose_one_b h hmember =>
+      exact ⟨rfl, h.2.2.1 _ hmember⟩
+  | castVote_proposal h =>
+      exact ⟨rfl, h.2.2.1⟩
+  | decide_vote h hmember =>
+      exact ⟨rfl, h.2.1 _ hmember⟩
+
+theorem communicationClosedRound_of_primaryRound
+    {s s' : State p} {r : p.Round}
+    (hnon : p.NonNoneRound r)
+    (hlocal : LocalTimeMonotoneStep s s')
+    (hprimary : PrimaryRoundChangesOnly s s' r) :
+    CommunicationClosedRound s s' r (emptyMedium p) (emptyMedium p) := by
+  exact
+    ⟨hnon,
+      (by intro msg h; exact h),
+      (by intro msg h; exact h),
+      hlocal,
+      primaryRound_sentByStep hprimary,
+      receivedInRound_present,
+      primaryRound_leftOnly hprimary⟩
 
 namespace Action
 
@@ -326,25 +477,35 @@ theorem step_communicationClosed
     CommunicationClosedStep s s' := by
   cases h with
   | send1a r hsend =>
+      have hlocal := Action.send1a_localTimeMonotone hsend
+      have hprimary := Action.send1a_primaryRoundChangesOnly hsend
       exact
-        ⟨r, hsend.1, Action.send1a_localTimeMonotone hsend,
-          Action.send1a_primaryRoundChangesOnly hsend, Action.readsMatchingRound s s' r⟩
+        ⟨r, communicationClosedRound_of_primaryRound hsend.1 hlocal hprimary,
+          hprimary, Action.readsMatchingRound s s' r⟩
   | joinRound n r maxr v hjoin =>
+      have hlocal := Action.joinRound_localTimeMonotone hjoin
+      have hprimary := Action.joinRound_primaryRoundChangesOnly hjoin
       exact
-        ⟨r, hjoin.1, Action.joinRound_localTimeMonotone hjoin,
-          Action.joinRound_primaryRoundChangesOnly hjoin, Action.readsMatchingRound s s' r⟩
+        ⟨r, communicationClosedRound_of_primaryRound hjoin.1 hlocal hprimary,
+          hprimary, Action.readsMatchingRound s s' r⟩
   | propose r q maxr v hpropose =>
+      have hlocal := Action.propose_localTimeMonotone hpropose
+      have hprimary := Action.propose_primaryRoundChangesOnly hpropose
       exact
-        ⟨r, hpropose.1, Action.propose_localTimeMonotone hpropose,
-          Action.propose_primaryRoundChangesOnly hpropose, Action.readsMatchingRound s s' r⟩
+        ⟨r, communicationClosedRound_of_primaryRound hpropose.1 hlocal hprimary,
+          hprimary, Action.readsMatchingRound s s' r⟩
   | castVote n r v hcast =>
+      have hlocal := Action.castVote_localTimeMonotone hcast
+      have hprimary := Action.castVote_primaryRoundChangesOnly hcast
       exact
-        ⟨r, hcast.1, Action.castVote_localTimeMonotone hcast,
-          Action.castVote_primaryRoundChangesOnly hcast, Action.readsMatchingRound s s' r⟩
+        ⟨r, communicationClosedRound_of_primaryRound hcast.1 hlocal hprimary,
+          hprimary, Action.readsMatchingRound s s' r⟩
   | decide n r v q hdecide =>
+      have hlocal := Action.decide_localTimeMonotone hdecide
+      have hprimary := Action.decide_primaryRoundChangesOnly hdecide
       exact
-        ⟨r, hdecide.1, Action.decide_localTimeMonotone hdecide,
-          Action.decide_primaryRoundChangesOnly hdecide, Action.readsMatchingRound s s' r⟩
+        ⟨r, communicationClosedRound_of_primaryRound hdecide.1 hlocal hprimary,
+          hprimary, Action.readsMatchingRound s s' r⟩
 
 /-- The Paxos transition relation satisfies the communication-closure property. -/
 def CommunicationClosedProtocol (p : Params) : Prop :=
