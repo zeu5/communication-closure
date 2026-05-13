@@ -8,6 +8,13 @@ layered than the Paxos one.  Log entries may be old but still relevant, and
 message handlers may either reject stale terms, process same/current-term
 messages, or advance the receiver to a higher term.  This file records the
 single-step discipline that is visible from the protocol state alone.
+
+Unlike the Paxos model, this Raft model has no persistent relation of sent
+messages.  Receive steps take a concrete message directly as an action
+parameter.  The communication-closure layer below therefore makes the boundary
+medium explicit and empty, proves that no visible sent messages are produced by
+this state-only model, and records that every modeled receive is handled in the
+message's own term.
 -/
 
 namespace CommunicationClosure.Proofs.Raft
@@ -20,6 +27,21 @@ variable {p : Params} [DecidableEq p.Server]
 /-- Raft's local clock is `currentTerm`, and it never decreases. -/
 def CurrentTermMonotoneStep (s s' : State p) : Prop :=
   ∀ i, s.currentTerm i ≤ s'.currentTerm i
+
+/-- The explicit medium used by the communication-closure proof layer. -/
+abbrev Medium (p : Params) := Message p → Prop
+
+/-- The medium has no in-flight messages. -/
+def MediumEmpty (m : Medium p) : Prop :=
+  ∀ msg, ¬ m msg
+
+/-- The boundary medium used by the state-only Raft model. -/
+def emptyMedium (p : Params) : Medium p :=
+  fun _ => False
+
+/-- The state-only Raft model has no explicit send action to expose here. -/
+def SentByStep (_s _s' : State p) (_msg : Message p) : Prop :=
+  False
 
 /-- A newly elected leader appends a no-op entry stamped with its current term. -/
 def LeaderNoopAtCurrentTerm (s s' : State p) (i : p.Server) : Prop :=
@@ -98,6 +120,22 @@ inductive ReceiveTermDiscipline (s s' : State p) : Nat → p.Server → Prop whe
       (term = s.currentTerm dest ∨ s' = s) →
       ReceiveTermDiscipline s s' term dest
 
+/-- A concrete Raft message consumed by a receive action in communication round `r`. -/
+def ReceivedInRound
+    (s s' : State p) (r : Nat) (dest : p.Server) (msg : Message p) : Prop :=
+  Message.term msg = r ∧ Message.dest msg = dest ∧ ReceiveTermDiscipline s s' r dest
+
+/-- The message/medium form of one Raft communication-closed step. -/
+def CommunicationClosedRound
+    (s s' : State p) (r : Nat) (preMedium postMedium : Medium p) : Prop :=
+  MediumEmpty preMedium ∧
+    MediumEmpty postMedium ∧
+    CurrentTermMonotoneStep s s' ∧
+    (∀ msg, SentByStep s s' msg → Message.term msg = r) ∧
+    (∀ msg dest,
+      ReceivedInRound s s' r dest msg →
+        Message.term msg = r ∧ Message.dest msg = dest ∧ ReceiveTermDiscipline s s' r dest)
+
 /-- The visible round discipline of one Raft step. -/
 inductive RoundDiscipline (s s' : State p) : Prop where
   | timeout (i : p.Server) :
@@ -122,7 +160,22 @@ inductive RoundDiscipline (s s' : State p) : Prop where
 
 /-- A single Raft step satisfies the no-history communication-closure discipline. -/
 def CommunicationClosedStep (s s' : State p) : Prop :=
-  CurrentTermMonotoneStep s s' ∧ RoundDiscipline s s'
+  ∃ r : Nat,
+    CommunicationClosedRound s s' r (emptyMedium p) (emptyMedium p) ∧
+      RoundDiscipline s s'
+
+theorem communicationClosedRound_of_currentTerm
+    {s s' : State p} {r : Nat}
+    (hmono : CurrentTermMonotoneStep s s') :
+    CommunicationClosedRound s s' r (emptyMedium p) (emptyMedium p) := by
+  exact
+    ⟨(by intro msg h; exact h),
+      (by intro msg h; exact h),
+      hmono,
+      (by intro msg h; cases h),
+      (by
+        intro msg dest hrecv
+        exact hrecv)⟩
 
 namespace Action
 
@@ -468,89 +521,111 @@ theorem step_communicationClosed
     CommunicationClosedStep s s' := by
   cases h with
   | becomeLeader i _ hleader =>
+      have hmono := Action.becomeLeader_currentTermMonotone hleader
       exact
-        ⟨Action.becomeLeader_currentTermMonotone hleader,
+        ⟨s.currentTerm i, communicationClosedRound_of_currentTerm hmono,
           RoundDiscipline.becomeLeader i hleader (Action.becomeLeader_noop hleader)⟩
   | clientRequest i v _ hclient =>
+      have hmono := Action.clientRequest_currentTermMonotone hclient
       exact
-        ⟨Action.clientRequest_currentTermMonotone hclient,
+        ⟨s.currentTerm i, communicationClosedRound_of_currentTerm hmono,
           RoundDiscipline.clientRequest i v hclient (Action.clientRequest_entry hclient)⟩
   | advanceCommitIndex i _ hadvance =>
+      have hmono := Action.advanceCommitIndex_currentTermMonotone hadvance
       exact
-        ⟨Action.advanceCommitIndex_currentTermMonotone hadvance,
+        ⟨s.currentTerm i, communicationClosedRound_of_currentTerm hmono,
           RoundDiscipline.advanceCommitIndex
             i hadvance (Action.advanceCommitIndex_justified hadvance)⟩
   | timeout i _ htimeout =>
+      have hmono := Action.timeout_currentTermMonotone htimeout
       exact
-        ⟨Action.timeout_currentTermMonotone htimeout,
+        ⟨s'.currentTerm i, communicationClosedRound_of_currentTerm hmono,
           RoundDiscipline.timeout i htimeout (Action.timeout_round htimeout)⟩
   | receiveRequestVoteRequest term lastLogTerm lastLogIndex source dest hrecv =>
       rcases hrecv with hupdate | hhandle
       · exact
-          ⟨Action.updateTerm_currentTermMonotone hupdate,
+          ⟨term, communicationClosedRound_of_currentTerm (Action.updateTerm_currentTermMonotone hupdate),
             RoundDiscipline.receive term dest (Action.updateTerm_receive hupdate)⟩
       · exact
-          ⟨Action.handleRequestVoteRequest_currentTermMonotone hhandle,
+          ⟨term,
+            communicationClosedRound_of_currentTerm
+              (Action.handleRequestVoteRequest_currentTermMonotone hhandle),
             RoundDiscipline.receive term dest
               (Action.handleRequestVoteRequest_receive hhandle)⟩
   | receiveRequestVoteResponse term voteGranted log source dest hrecv =>
       rcases hrecv with hupdate | hstale | hhandle
       · exact
-          ⟨Action.updateTerm_currentTermMonotone hupdate,
+          ⟨term, communicationClosedRound_of_currentTerm (Action.updateTerm_currentTermMonotone hupdate),
             RoundDiscipline.receive term dest (Action.updateTerm_receive hupdate)⟩
       · exact
-          ⟨Action.dropStaleResponse_currentTermMonotone hstale,
+          ⟨term,
+            communicationClosedRound_of_currentTerm
+              (Action.dropStaleResponse_currentTermMonotone hstale),
             RoundDiscipline.receive term dest (Action.dropStaleResponse_receive hstale)⟩
       · exact
-          ⟨Action.handleRequestVoteResponse_currentTermMonotone hhandle,
+          ⟨term,
+            communicationClosedRound_of_currentTerm
+              (Action.handleRequestVoteResponse_currentTermMonotone hhandle),
             RoundDiscipline.receive term dest
               (Action.handleRequestVoteResponse_receive hhandle)⟩
   | receiveAppendEntriesRequest term prevLogIndex prevLogTerm entries commitIndex source dest hrecv =>
       rcases hrecv with hupdate | hhandle
       · exact
-          ⟨Action.updateTerm_currentTermMonotone hupdate,
+          ⟨term, communicationClosedRound_of_currentTerm (Action.updateTerm_currentTermMonotone hupdate),
             RoundDiscipline.receive term dest (Action.updateTerm_receive hupdate)⟩
       · exact
-          ⟨Action.handleAppendEntriesRequest_currentTermMonotone hhandle,
+          ⟨term,
+            communicationClosedRound_of_currentTerm
+              (Action.handleAppendEntriesRequest_currentTermMonotone hhandle),
             RoundDiscipline.receive term dest
               (Action.handleAppendEntriesRequest_receive hhandle)⟩
   | receiveAppendEntriesResponse term success matchIndex source dest hrecv =>
       rcases hrecv with hupdate | hstale | hhandle
       · exact
-          ⟨Action.updateTerm_currentTermMonotone hupdate,
+          ⟨term, communicationClosedRound_of_currentTerm (Action.updateTerm_currentTermMonotone hupdate),
             RoundDiscipline.receive term dest (Action.updateTerm_receive hupdate)⟩
       · exact
-          ⟨Action.dropStaleResponse_currentTermMonotone hstale,
+          ⟨term,
+            communicationClosedRound_of_currentTerm
+              (Action.dropStaleResponse_currentTermMonotone hstale),
             RoundDiscipline.receive term dest (Action.dropStaleResponse_receive hstale)⟩
       · exact
-          ⟨Action.handleAppendEntriesResponse_currentTermMonotone hhandle,
+          ⟨term,
+            communicationClosedRound_of_currentTerm
+              (Action.handleAppendEntriesResponse_currentTermMonotone hhandle),
             RoundDiscipline.receive term dest
               (Action.handleAppendEntriesResponse_receive hhandle)⟩
   | receiveCatchupRequest term logLen entries commitIndex source dest rounds hrecv =>
       rcases hrecv with hupdate | hhandle
       · exact
-          ⟨Action.updateTerm_currentTermMonotone hupdate,
+          ⟨term, communicationClosedRound_of_currentTerm (Action.updateTerm_currentTermMonotone hupdate),
             RoundDiscipline.receive term dest (Action.updateTerm_receive hupdate)⟩
       · exact
-          ⟨Action.handleCatchupRequest_currentTermMonotone hhandle,
+          ⟨term,
+            communicationClosedRound_of_currentTerm
+              (Action.handleCatchupRequest_currentTermMonotone hhandle),
             RoundDiscipline.receive term dest
               (Action.handleCatchupRequest_receive hhandle)⟩
   | receiveCatchupResponse term success matchIndex source dest roundsLeft hrecv =>
       rcases hrecv with hupdate | hhandle
       · exact
-          ⟨Action.updateTerm_currentTermMonotone hupdate,
+          ⟨term, communicationClosedRound_of_currentTerm (Action.updateTerm_currentTermMonotone hupdate),
             RoundDiscipline.receive term dest (Action.updateTerm_receive hupdate)⟩
       · exact
-          ⟨Action.handleCatchupResponse_currentTermMonotone hhandle,
+          ⟨term,
+            communicationClosedRound_of_currentTerm
+              (Action.handleCatchupResponse_currentTermMonotone hhandle),
             RoundDiscipline.receive term dest
               (Action.handleCatchupResponse_receive hhandle)⟩
   | receiveCheckOldConfig term add server source dest hrecv =>
       rcases hrecv with hupdate | hhandle
       · exact
-          ⟨Action.updateTerm_currentTermMonotone hupdate,
+          ⟨term, communicationClosedRound_of_currentTerm (Action.updateTerm_currentTermMonotone hupdate),
             RoundDiscipline.receive term dest (Action.updateTerm_receive hupdate)⟩
       · exact
-          ⟨Action.handleCheckOldConfig_currentTermMonotone hhandle,
+          ⟨term,
+            communicationClosedRound_of_currentTerm
+              (Action.handleCheckOldConfig_currentTermMonotone hhandle),
             RoundDiscipline.receive term dest
               (Action.handleCheckOldConfig_receive hhandle)⟩
 

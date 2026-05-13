@@ -8,6 +8,11 @@ base protocol state.  With ghost history, the closure fact is more direct: each
 step records the local communication event that explains the step, and the
 history projections make the event's terms, received message, log transition,
 append, leadership, and commit facts immediately available in the post-state.
+
+As in the state-only Raft proof, the base protocol does not expose send actions
+or a concrete network buffer.  The history-bearing closure layer therefore uses
+an explicit empty boundary medium and ties receive events to the concrete
+message recorded in ghost history.
 -/
 
 namespace CommunicationClosure.Proofs.RaftWithHistory
@@ -15,6 +20,44 @@ namespace CommunicationClosure.Proofs.RaftWithHistory
 open CommunicationClosure.Protocols.RaftWithHistory
 
 variable {p : Params} [DecidableEq p.Server]
+
+/-- The explicit medium used by the communication-closure proof layer. -/
+abbrev Medium (p : Params) := Message p → Prop
+
+/-- The medium has no in-flight messages. -/
+def MediumEmpty (m : Medium p) : Prop :=
+  ∀ msg, ¬ m msg
+
+/-- The boundary medium used by the history-bearing Raft model. -/
+def emptyMedium (p : Params) : Medium p :=
+  fun _ => False
+
+/-- The Raft model has no explicit send action to expose at this proof layer. -/
+def SentByEvent (_event : Event p) (_msg : Message p) : Prop :=
+  False
+
+namespace Event
+
+variable {p : Params}
+
+/-- The communication round represented by a recorded event. -/
+def communicationRound : Event p → Nat
+  | Event.timeout _ _ newTerm => newTerm
+  | Event.becameLeader _ term _ _ => term
+  | Event.clientRequest _ term _ _ _ => term
+  | Event.commitAdvanced _ term _ _ => term
+  | Event.received msg .. => CommunicationClosure.Protocols.Raft.Message.term msg
+
+end Event
+
+/-- A concrete message consumed by a recorded receive event in round `r`. -/
+inductive ReceivedInRound : Event p → Nat → p.Server → Message p → Prop where
+  | received
+      {msg : Message p} {dest : p.Server} {oldTerm newTerm : Nat}
+      {oldLog newLog : List (Entry p)} :
+      CommunicationClosure.Protocols.Raft.Message.term msg = r →
+      ReceivedInRound
+        (Event.received msg dest oldTerm newTerm oldLog newLog) r dest msg
 
 /-- A server is known, from history, to have behaved in the given Raft term. -/
 def ProcessInRound (h : History p) (i : p.Server) (term : Nat) : Prop :=
@@ -49,6 +92,18 @@ def ProcessCommitInRound
     (h : History p) (i : p.Server) (term oldCommit newCommit : Nat) : Prop :=
   ProcessInRound h i term ∧
     h.commitAdvanced i term oldCommit newCommit
+
+/-- The message/medium form of one history-recorded communication-closed step. -/
+def EventCommunicationClosedRound
+    (h : History p) (event : Event p) (r : Nat)
+    (preMedium postMedium : Medium p) : Prop :=
+  MediumEmpty preMedium ∧
+    MediumEmpty postMedium ∧
+    (∀ msg, SentByEvent event msg → CommunicationClosure.Protocols.Raft.Message.term msg = r) ∧
+    (∀ msg dest,
+      ReceivedInRound event r dest msg →
+        CommunicationClosure.Protocols.Raft.Message.term msg = r ∧
+          ProcessReceivesInRound h dest msg)
 
 /--
 The history-defined round behavior for a single event.  This is the
@@ -85,7 +140,9 @@ def CommunicationClosedStep (s s' : State p) : Prop :=
   ∃ event,
     Action.Records event s s' ∧
       s'.history.events = s.history.events ++ [event] ∧
-      ProcessRoundBehavior s'.history event
+      ProcessRoundBehavior s'.history event ∧
+      EventCommunicationClosedRound
+        s'.history event (Event.communicationRound event) (emptyMedium p) (emptyMedium p)
 
 namespace Action
 
@@ -130,15 +187,36 @@ theorem record_processRoundBehavior
           History.record, Event.observesTerm]
       · simp [History.record]
 
+theorem record_eventCommunicationClosedRound
+    {h : History p} {event : Event p} :
+    EventCommunicationClosedRound
+      (h.record event) event (Event.communicationRound event) (emptyMedium p) (emptyMedium p) := by
+  refine
+    ⟨(by intro msg hmsg; exact hmsg),
+      (by intro msg hmsg; exact hmsg),
+      ?_,
+      ?_⟩
+  · intro msg hsent
+    cases hsent
+  · intro msg dest hrecv
+    cases hrecv with
+    | received hterm =>
+        refine ⟨hterm, ?_⟩
+        simp [
+          ProcessReceivesInRound, ProcessInRound,
+          History.record, Event.observesTerm]
+
 theorem records_communicationClosed
     {s s' : State p} {event : Event p}
     (hrecord : Action.Records event s s') :
     CommunicationClosedStep s s' := by
-  refine ⟨event, hrecord, ?_, ?_⟩
+  refine ⟨event, hrecord, ?_, ?_, ?_⟩
   · rw [hrecord]
     simp [History.record]
   · rw [hrecord]
     exact record_processRoundBehavior
+  · rw [hrecord]
+    exact record_eventCommunicationClosedRound
 
 end Action
 
